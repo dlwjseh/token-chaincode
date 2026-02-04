@@ -473,7 +473,7 @@ func (s *SmartContract) Approve(ctx contractapi.TransactionContextInterface, spe
 		return fmt.Errorf("이벤트를 설정하지 못했습니다: %v", err)
 	}
 
-	log.Printf("클라이언트 %s이(가) 지출자 %s에 대해 %d의 인출 허용액을 승인했습니다.", owner, value, spender)
+	log.Printf("클라이언트 %s이(가) 지출자 %s에 대해 %d의 인출 허용액을 승인했습니다.", owner, spender, value)
 
 	return nil
 }
