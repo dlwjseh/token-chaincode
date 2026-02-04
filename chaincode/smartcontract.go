@@ -23,6 +23,14 @@ type SmartContract struct {
 	contractapi.Contract
 }
 
+// TransferRequest: 출금 시 생성되는 "송금 대기표"
+type TransferRequest struct {
+	Sender   string `json:"sender"`   // 보낸 사람
+	Receiver string `json:"receiver"` // 받을 사람
+	Amount   int    `json:"amount"`   // 금액
+	Status   string `json:"status"`   // 상태: "PENDING"(대기중), "COMPLETED"(완료)
+}
+
 // event 이벤트 방출을 위한 조직화된 구조체를 제공합니다.
 type event struct {
 	From  string `json:"from"`
@@ -224,10 +232,9 @@ func (s *SmartContract) Burn(ctx contractapi.TransactionContextInterface, amount
 	return nil
 }
 
-// Transfer 클라이언트 계정에서 수신자 계정으로 토큰을 전송합니다.
-// 수신자 계정은 ClientID() 함수에서 반환된 유효한 clientID여야 합니다.
+// TransferDebit
 // 이 함수는 Transfer 이벤트를 트리거합니다.
-func (s *SmartContract) Transfer(ctx contractapi.TransactionContextInterface, recipient string, amount int) error {
+func (s *SmartContract) TransferDebit(ctx contractapi.TransactionContextInterface, recipient string, amount int) error {
 	// 먼저 계약이 초기화되었는지 확인
 	initialized, err := checkInitialized(ctx)
 	if err != nil {
@@ -243,20 +250,72 @@ func (s *SmartContract) Transfer(ctx contractapi.TransactionContextInterface, re
 		return fmt.Errorf("클라이언트 ID를 가져오지 못했습니다: %v", err)
 	}
 
-	err = transferHelper(ctx, clientID, recipient, amount)
-	if err != nil {
-		return fmt.Errorf("전송 실패: %v", err)
+	if clientID == recipient {
+		return fmt.Errorf("동일한 고객 계정으로 이체할 수 없습니다.")
 	}
 
-	// Transfer 이벤트를 내보냅니다.
-	transferEvent := event{clientID, recipient, amount}
-	transferEventJSON, err := json.Marshal(transferEvent)
+	if amount < 0 { // ERC-20에서는 0의 전송이 허용되므로 음수 금액에 대해 유효성을 검사합니다.
+		return fmt.Errorf("이체 금액은 음수일 수 없습니다.")
+	}
+
+	// 클라이언트 계정 잔액 조회
+	clientCurrentBalanceBytes, err := ctx.GetStub().GetState(clientID)
+	if err != nil {
+		return fmt.Errorf("클라이언트 계정 %s을(를) World State에서 읽지 못했습니다: %v", clientID, err)
+	}
+
+	// 수신자 계정 존재 여부 확인 (Read-Only verify)
+	recipientBalanceBytes, err := ctx.GetStub().GetState(recipient)
+	if err != nil {
+		return fmt.Errorf("수신자 계정 %s을(를) World State에서 읽지 못했습니다: %v", recipient, err)
+	}
+	if recipientBalanceBytes == nil {
+		return fmt.Errorf("수신자 계정 %s이(가) 존재하지 않습니다.", recipient)
+	}
+
+	if clientCurrentBalanceBytes == nil {
+		return fmt.Errorf("고객 계정 %s에 잔고가 없습니다", clientID)
+	}
+
+	// 계정 잔액을 설정할 때 Itoa()를 사용하여 정수임을 보장하므로 오류 처리가 필요하지 않습니다.
+	clientCurrentBalance, _ := strconv.Atoi(string(clientCurrentBalanceBytes))
+
+	if clientCurrentBalance < amount {
+		return fmt.Errorf("고객 계정 %s에 자금이 부족합니다.", clientID)
+	}
+
+	// 클라이언트 잔액 차감
+	clientUpdatedBalance, err := sub(clientCurrentBalance, amount)
+	if err != nil {
+		return err
+	}
+
+	err = ctx.GetStub().PutState(clientID, []byte(strconv.Itoa(clientUpdatedBalance)))
+	if err != nil {
+		return err
+	}
+
+	// "송금 대기표(Request)" 생성
+	txID := ctx.GetStub().GetTxID() // 트랜잭션 ID를 고유 키로 사용
+	transferReqKey, err := ctx.GetStub().CreateCompositeKey("transferReq", []string{txID})
+	if err != nil {
+		return fmt.Errorf("송금 대기표 복합 키를 생성하지 못했습니다: %v", err)
+	}
+
+	transferRequest := TransferRequest{Sender: clientID, Receiver: recipient, Amount: amount, Status: "PENDING"}
+	transferReqBytes, err := json.Marshal(transferRequest)
 	if err != nil {
 		return fmt.Errorf("JSON 인코딩을 가져오지 못했습니다: %v", err)
 	}
-	err = ctx.GetStub().SetEvent("Transfer", transferEventJSON)
+
+	err = ctx.GetStub().PutState(transferReqKey, transferReqBytes) // 대기표 저장
 	if err != nil {
-		return fmt.Errorf("이벤트를 설정하지 못했습니다: %v", err)
+		return err
+	}
+
+	err = ctx.GetStub().SetEvent("DebitEvent", transferReqBytes)
+	if err != nil {
+		return fmt.Errorf("송금 대기표 이벤트를 설정하지 못했습니다: %v", err)
 	}
 
 	return nil
@@ -475,6 +534,14 @@ func (s *SmartContract) TransferFrom(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("클라이언트 ID를 가져오지 못했습니다: %v", err)
 	}
 
+	if from == to {
+		return fmt.Errorf("동일한 고객 계정으로 이체할 수 없습니다.")
+	}
+
+	if value < 0 {
+		return fmt.Errorf("이체 금액은 음수일 수 없습니다.")
+	}
+
 	// 허용키 생성
 	allowanceKey, err := ctx.GetStub().CreateCompositeKey(allowancePrefix, []string{from, spender})
 	if err != nil {
@@ -488,19 +555,53 @@ func (s *SmartContract) TransferFrom(ctx contractapi.TransactionContextInterface
 	}
 
 	var currentAllowance int
-
-	// totalSupply를 설정할 때 Itoa()가 사용되어 정수임을 보장하므로 오류 처리가 필요하지 않습니다.
-	currentAllowance, _ = strconv.Atoi(string(currentAllowanceBytes))
+	if currentAllowanceBytes == nil {
+		currentAllowance = 0
+	} else {
+		// totalSupply를 설정할 때 Itoa()가 사용되어 정수임을 보장하므로 오류 처리가 필요하지 않습니다.
+		currentAllowance, _ = strconv.Atoi(string(currentAllowanceBytes))
+	}
 
 	// 이체금액이 허용량보다 적은지 확인
 	if currentAllowance < value {
 		return fmt.Errorf("지출자에게는 이체할 수 있는 여유가 충분하지 않습니다.")
 	}
 
-	// 전송
-	err = transferHelper(ctx, from, to, value)
+	// 수신자 계정 존재 여부 확인 (Read-Only verify)
+	toBalanceBytes, err := ctx.GetStub().GetState(to)
 	if err != nil {
-		return fmt.Errorf("전송 실패: %v", err)
+		return fmt.Errorf("수신자 계정 %s을(를) World State에서 읽지 못했습니다: %v", to, err)
+	}
+	if toBalanceBytes == nil {
+		return fmt.Errorf("수신자 계정 %s이(가) 존재하지 않습니다.", to)
+	}
+
+	// sender(from) 잔액 조회
+	fromCurrentBalanceBytes, err := ctx.GetStub().GetState(from)
+	if err != nil {
+		return fmt.Errorf("클라이언트 계정 %s을(를) World State에서 읽지 못했습니다: %v", from, err)
+	}
+
+	if fromCurrentBalanceBytes == nil {
+		return fmt.Errorf("고객 계정 %s에 잔고가 없습니다", from)
+	}
+
+	// 계정 잔액을 설정할 때 Itoa()를 사용하여 정수임을 보장하므로 오류 처리가 필요하지 않습니다.
+	fromCurrentBalance, _ := strconv.Atoi(string(fromCurrentBalanceBytes))
+
+	if fromCurrentBalance < value {
+		return fmt.Errorf("고객 계정 %s에 자금이 부족합니다.", from)
+	}
+
+	// sender 잔액 차감
+	fromUpdatedBalance, err := sub(fromCurrentBalance, value)
+	if err != nil {
+		return err
+	}
+
+	err = ctx.GetStub().PutState(from, []byte(strconv.Itoa(fromUpdatedBalance)))
+	if err != nil {
+		return err
 	}
 
 	// 허용량 감소
@@ -514,18 +615,31 @@ func (s *SmartContract) TransferFrom(ctx contractapi.TransactionContextInterface
 		return err
 	}
 
-	// Transfer 이벤트를 내보냅니다.
-	transferEvent := event{from, to, value}
-	transferEventJSON, err := json.Marshal(transferEvent)
+	// "송금 대기표(Request)" 생성
+	txID := ctx.GetStub().GetTxID() // 트랜잭션 ID를 고유 키로 사용
+	transferReqKey, err := ctx.GetStub().CreateCompositeKey("transferReq", []string{txID})
+	if err != nil {
+		return fmt.Errorf("송금 대기표 복합 키를 생성하지 못했습니다: %v", err)
+	}
+
+	transferRequest := TransferRequest{Sender: from, Receiver: to, Amount: value, Status: "PENDING"}
+	transferReqBytes, err := json.Marshal(transferRequest)
 	if err != nil {
 		return fmt.Errorf("JSON 인코딩을 가져오지 못했습니다: %v", err)
 	}
-	err = ctx.GetStub().SetEvent("Transfer", transferEventJSON)
+
+	err = ctx.GetStub().PutState(transferReqKey, transferReqBytes) // 대기표 저장
 	if err != nil {
-		return fmt.Errorf("이벤트 설정 실패: %v", err)
+		return err
+	}
+
+	err = ctx.GetStub().SetEvent("DebitEvent", transferReqBytes)
+	if err != nil {
+		return fmt.Errorf("송금 대기표 이벤트를 설정하지 못했습니다: %v", err)
 	}
 
 	log.Printf("소비자 %s 허용량이 %d에서 %d(으)로 업데이트되었습니다.", spender, currentAllowance, updatedAllowance)
+	log.Printf("송금자 %s 잔액이 %d에서 %d(으)로 업데이트되었습니다.", from, fromCurrentBalance, fromUpdatedBalance)
 
 	return nil
 }
@@ -611,74 +725,24 @@ func (s *SmartContract) Initialize(ctx contractapi.TransactionContextInterface, 
 	return true, nil
 }
 
-// Helper Functions
+// GetTransferStatus 트랜잭션 ID를 사용하여 송금 요청의 상태를 반환합니다.
+// param {String} txID 트랜잭션 ID
+// returns {String} 송금 상태 ("PENDING" 또는 "COMPLETED")를 반환합니다.
+func (s *SmartContract) GetTransferStatus(ctx contractapi.TransactionContextInterface, txID string) (string, error) {
+	reqKey, _ := ctx.GetStub().CreateCompositeKey("transferReq", []string{txID})
+	reqBytes, _ := ctx.GetStub().GetState(reqKey)
 
-// transferHelper "from" 주소에서 "to" 주소로 토큰을 전송하는 도우미 기능입니다.
-// 종속 함수에는 Transfer 및 TransferFrom이 포함됩니다.
-func transferHelper(ctx contractapi.TransactionContextInterface, from string, to string, value int) error {
-	if from == to {
-		return fmt.Errorf("동일한 고객 계정으로 이체할 수 없습니다.")
+	if reqBytes == nil {
+		return "", fmt.Errorf("transaction not found")
 	}
 
-	if value < 0 { // ERC-20에서는 0의 전송이 허용되므로 음수 금액에 대해 유효성을 검사합니다.
-		return fmt.Errorf("이체 금액은 음수일 수 없습니다.")
-	}
+	var request TransferRequest
+	json.Unmarshal(reqBytes, &request)
 
-	fromCurrentBalanceBytes, err := ctx.GetStub().GetState(from)
-	if err != nil {
-		return fmt.Errorf("클라이언트 계정 %s을(를) World State에서 읽지 못했습니다: %v", from, err)
-	}
-
-	if fromCurrentBalanceBytes == nil {
-		return fmt.Errorf("고객 계정 %s에 잔고가 없습니다", from)
-	}
-
-	// 계정 잔액을 설정할 때 Itoa()를 사용하여 정수임을 보장하므로 오류 처리가 필요하지 않습니다.
-	fromCurrentBalance, _ := strconv.Atoi(string(fromCurrentBalanceBytes))
-
-	if fromCurrentBalance < value {
-		return fmt.Errorf("고객 계정 %s에 자금이 부족합니다.", from)
-	}
-
-	toCurrentBalanceBytes, err := ctx.GetStub().GetState(to)
-	if err != nil {
-		return fmt.Errorf("World State에서 수신자 계정 %s을(를) 읽지 못했습니다: %v", to, err)
-	}
-
-	var toCurrentBalance int
-	// 수신자 현재 잔액이 아직 존재하지 않는 경우 현재 잔액을 0으로 생성합니다.
-	if toCurrentBalanceBytes == nil {
-		toCurrentBalance = 0
-	} else {
-		// 계정 잔액을 설정할 때 Itoa()를 사용하여 정수임을 보장하므로 오류 처리가 필요하지 않습니다.
-		toCurrentBalance, _ = strconv.Atoi(string(toCurrentBalanceBytes))
-	}
-
-	fromUpdatedBalance, err := sub(fromCurrentBalance, value)
-	if err != nil {
-		return err
-	}
-
-	toUpdatedBalance, err := add(toCurrentBalance, value)
-	if err != nil {
-		return err
-	}
-
-	err = ctx.GetStub().PutState(from, []byte(strconv.Itoa(fromUpdatedBalance)))
-	if err != nil {
-		return err
-	}
-
-	err = ctx.GetStub().PutState(to, []byte(strconv.Itoa(toUpdatedBalance)))
-	if err != nil {
-		return err
-	}
-
-	log.Printf("클라이언트 %s 잔액이 %d에서 %d(으)로 업데이트되었습니다.", from, fromCurrentBalance, fromUpdatedBalance)
-	log.Printf("수신자 %s 잔액이 %d에서 %d(으)로 업데이트되었습니다.", to, toCurrentBalance, toUpdatedBalance)
-
-	return nil
+	return request.Status, nil // "PENDING" or "COMPLETED"
 }
+
+// Helper Functions
 
 // 계약 옵션 초기화가 잘 되었는지 확인합니다.
 func checkInitialized(ctx contractapi.TransactionContextInterface) (bool, error) {
