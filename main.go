@@ -3,8 +3,9 @@ package main
 import (
 	"log"
 
+	"token-chaincode/chaincode"
+
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
-	"github.com/jd/token-chaincode/chaincode"
 )
 
 func main() {
